@@ -31,6 +31,13 @@ pub struct Hit {
     pub name: String,
 }
 
+/// A symbol and the calls it makes to some name.
+#[derive(Debug, Clone)]
+pub struct Calls {
+    pub target: Hit,
+    pub sites: Vec<OccRec>,
+}
+
 /// An occurrence together with the name of the symbol enclosing it.
 #[derive(Debug, Clone)]
 pub struct OccHit {
@@ -283,6 +290,95 @@ impl Db {
         (out, total)
     }
 
+    /// Up to `limit` symbols that call `name`, each with the calls it makes,
+    /// plus the true number of callers.
+    ///
+    /// The call positions are what an editor highlights when you pick a caller
+    /// in a call hierarchy. Returning only the caller left it to highlight the
+    /// caller's own name, which is not where anything is called.
+    pub fn call_sites(&self, name: &str, limit: usize) -> (Vec<Calls>, usize) {
+        // Keyed by (shard, enclosing id); first-seen order is occurrence
+        // order, i.e. by file and then position, so the output is stable.
+        let mut order: Vec<(bool, SymbolId)> = Vec::new();
+        let mut sites: rustc_hash::FxHashMap<(bool, SymbolId), Vec<OccRec>> = Default::default();
+        let mut collect = |overlay: bool, ix: &Index| {
+            for i in ix.reference_ids(name).iter() {
+                let Some(o) = ix.occurrence(i) else { continue };
+                if o.role != crate::ROLE_CALL || o.enclosing == crate::NO_SYMBOL {
+                    continue;
+                }
+                if !overlay && !self.live(o.file) {
+                    continue;
+                }
+                sites
+                    .entry((overlay, o.enclosing))
+                    .or_insert_with(|| {
+                        order.push((overlay, o.enclosing));
+                        Vec::new()
+                    })
+                    .push(o);
+            }
+        };
+        collect(false, &self.main);
+        if let Some(o) = &self.overlay {
+            collect(true, o);
+        }
+
+        let total = order.len();
+        let out = order
+            .into_iter()
+            .take(limit)
+            .filter_map(|key| {
+                let ix = if key.0 {
+                    self.overlay.as_ref()?
+                } else {
+                    &self.main
+                };
+                let rec = ix.symbol(key.1)?;
+                Some(Calls {
+                    target: Hit {
+                        name: ix.name_text(rec.name).unwrap_or("").to_string(),
+                        rec,
+                    },
+                    sites: sites.remove(&key).unwrap_or_default(),
+                })
+            })
+            .collect();
+        (out, total)
+    }
+
+    /// What `sym` calls: one entry per callee name, in order of first call,
+    /// each with the positions of its calls inside `sym`.
+    pub fn callee_sites(&self, sym: SymbolId) -> Vec<(String, Vec<OccRec>)> {
+        let base = self.overlay_base();
+        let (ix, local) = if sym < base {
+            (&self.main, sym)
+        } else {
+            match &self.overlay {
+                Some(o) => (o, sym - base),
+                None => return Vec::new(),
+            }
+        };
+        let Some(rec) = ix.symbol(local) else {
+            return Vec::new();
+        };
+        // A symbol's calls all lie in its own file, whose occurrences are one
+        // contiguous run — a few thousand records at most.
+        let mut out: Vec<(String, Vec<OccRec>)> = Vec::new();
+        let mut at: rustc_hash::FxHashMap<NameId, usize> = Default::default();
+        for o in ix.occurrences_in_file(rec.file) {
+            if o.role != crate::ROLE_CALL || o.enclosing != local {
+                continue;
+            }
+            let i = *at.entry(o.name).or_insert_with(|| {
+                out.push((ix.name_text(o.name).unwrap_or("").to_string(), Vec::new()));
+                out.len() - 1
+            });
+            out[i].1.push(o);
+        }
+        out
+    }
+
     /// Up to `limit` callers, plus the true number of live matches.
     pub fn callers_limited(&self, name: &str, limit: usize) -> (Vec<Hit>, usize) {
         let mut out = Vec::with_capacity(limit.min(64));
@@ -532,6 +628,140 @@ mod tests {
         let mut t = RoaringBitmap::new();
         t.insert(f0);
         Db::save_tombstones(dir, &t).unwrap();
+    }
+
+    /// a.c: `outer` calls `inner` twice and `other` once; b.c: `elsewhere`
+    /// calls `inner` once.
+    fn build_calls(dir: &Path) {
+        let g = store::fresh(dir, store::Kind::Main).unwrap();
+        let mut w = IndexWriter::new();
+        let a = w.add_file("a.c");
+        let b = w.add_file("b.c");
+        let (outer, inner, other, elsewhere) = (
+            w.intern("outer"),
+            w.intern("inner"),
+            w.intern("other"),
+            w.intern("elsewhere"),
+        );
+        let def = |name, file, off| SymbolRec {
+            name,
+            file,
+            off,
+            len: 5,
+            enclosing: NO_SYMBOL,
+            pc: 0,
+            kind: 0,
+            is_def: true,
+            ..Default::default()
+        };
+        let s_outer = w.push_symbol(def(outer, a, 4));
+        let s_else = w.push_symbol(def(elsewhere, b, 4));
+        let call = |name, file, off, enclosing| OccRec {
+            name,
+            file,
+            off,
+            len: 5,
+            enclosing,
+            pc: 0,
+            role: crate::ROLE_CALL,
+            ..Default::default()
+        };
+        w.push_occurrence(call(inner, a, 20, s_outer));
+        w.push_occurrence(call(other, a, 30, s_outer));
+        w.push_occurrence(call(inner, a, 40, s_outer));
+        w.push_occurrence(call(inner, b, 20, s_else));
+        w.write(&dir.join(&g)).unwrap();
+        store::publish(
+            dir,
+            &store::Pointer {
+                main: g,
+                overlay: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn callers_come_with_the_positions_of_their_calls() {
+        let d = tmpdir("call-sites");
+        build_calls(&d);
+        let db = Db::open(&d).unwrap();
+        let (calls, total) = db.call_sites("inner", 10);
+        assert_eq!(total, 2);
+        let got: Vec<(&str, Vec<u32>)> = calls
+            .iter()
+            .map(|c| {
+                (
+                    c.target.name.as_str(),
+                    c.sites.iter().map(|o| o.off).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(got, [("outer", vec![20, 40]), ("elsewhere", vec![20])]);
+        // The cap limits callers, not the count.
+        let (calls, total) = db.call_sites("inner", 1);
+        assert_eq!((calls.len(), total), (1, 2));
+    }
+
+    #[test]
+    fn callees_come_with_the_positions_of_their_calls() {
+        let d = tmpdir("callee-sites");
+        build_calls(&d);
+        let db = Db::open(&d).unwrap();
+        let outer = db.symbol_ids_named("outer")[0];
+        let got: Vec<(String, Vec<u32>)> = db
+            .callee_sites(outer)
+            .into_iter()
+            .map(|(n, s)| (n, s.iter().map(|o| o.off).collect()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("inner".to_string(), vec![20, 40]),
+                ("other".to_string(), vec![30])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_superseded_files_call_sites_disappear() {
+        let d = tmpdir("call-sites-tomb");
+        build_calls(&d);
+        // b.c re-indexed with its call removed.
+        let g = store::fresh(&d, store::Kind::Overlay).unwrap();
+        let mut w = IndexWriter::new();
+        w.add_file("a.c");
+        let b = w.add_file("b.c");
+        let n = w.intern("elsewhere");
+        w.push_symbol(SymbolRec {
+            name: n,
+            file: b,
+            off: 4,
+            len: 9,
+            enclosing: NO_SYMBOL,
+            pc: 0,
+            kind: 0,
+            is_def: true,
+            ..Default::default()
+        });
+        w.write(&d.join(&g)).unwrap();
+        let mut t = RoaringBitmap::new();
+        t.insert(b);
+        Db::save_tombstones(&d.join(&g), &t).unwrap();
+        let main = store::current(&d).unwrap().unwrap().main;
+        store::publish(
+            &d,
+            &store::Pointer {
+                main,
+                overlay: Some(g),
+            },
+        )
+        .unwrap();
+
+        let db = Db::open(&d).unwrap();
+        let (calls, total) = db.call_sites("inner", 10);
+        assert_eq!(total, 1);
+        assert_eq!(calls[0].target.name, "outer");
     }
 
     #[test]

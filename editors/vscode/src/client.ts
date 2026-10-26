@@ -13,6 +13,8 @@ export interface Loc {
   isDefinition?: boolean;
   role?: string;
   enclosing?: string | null;
+  /** Call hierarchy: where the calls are, in the calling function's file. */
+  calls?: { line: number; column: number; length: number }[];
 }
 
 /** A build the server ran because files changed. */

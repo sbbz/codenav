@@ -10,7 +10,7 @@
 
 use crate::watch::Status;
 use codenav_index::db::Hit;
-use codenav_index::{store, Db, SymbolRec, ROLE_CALL, ROLE_DECL, ROLE_DEF};
+use codenav_index::{store, Db, OccRec, SymbolRec, ROLE_CALL, ROLE_DECL, ROLE_DEF};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -564,14 +564,26 @@ fn refs(ix: &Db, name: &str, limit: usize) -> Vec<Value> {
     out
 }
 
+/// Where the calls themselves are. Always in the file of the function making
+/// them, so the path is implied and left out.
+fn sites(occs: &[OccRec]) -> Value {
+    json!(occs
+        .iter()
+        .map(|o| json!({ "offset": o.off, "length": o.len, "line": o.line, "column": o.col }))
+        .collect::<Vec<_>>())
+}
+
+/// Each caller carries `calls`: the positions inside it where `name` is
+/// called, which is what an editor highlights for a call hierarchy entry.
 fn callers(ix: &Db, name: &str, limit: usize) -> Vec<Value> {
-    let (syms, total) = ix.callers_limited(name, limit);
-    let mut out = Vec::with_capacity(syms.len());
-    for h in syms.iter() {
-        let s = &h.rec;
+    let (callers, total) = ix.call_sites(name, limit);
+    let mut out = Vec::with_capacity(callers.len());
+    for c in &callers {
+        let s = &c.target.rec;
         let mut v = loc(ix, s.file, s.off, s.len, s.line, s.col);
-        v["name"] = json!(h.name);
+        v["name"] = json!(c.target.name);
         v["kind"] = json!(kind_name(s.kind));
+        v["calls"] = sites(&c.sites);
         out.push(v);
     }
     if let (true, Some(first)) = (total > limit, out.first_mut()) {
@@ -599,9 +611,10 @@ fn callees(ix: &Db, name: &str, ctx: Option<&Ctx>) -> Vec<Value> {
         return Vec::new();
     };
 
-    let callee_names = ix.callees_of(id);
-    let mut out = Vec::with_capacity(callee_names.len());
-    for text in callee_names {
+    // Each callee carries `calls`: where inside this function it is called.
+    let callees = ix.callee_sites(id);
+    let mut out = Vec::with_capacity(callees.len());
+    for (text, at) in callees {
         (|| {
             // Point at the callee's definition, ranked the same way go-to-def
             // is — otherwise an unrelated copy in some selftest can win.
@@ -621,6 +634,7 @@ fn callees(ix: &Db, name: &str, ctx: Option<&Ctx>) -> Vec<Value> {
             );
             v["name"] = json!(text);
             v["kind"] = json!(kind_name(target.kind));
+            v["calls"] = sites(&at);
             out.push(v);
             Some(())
         })();

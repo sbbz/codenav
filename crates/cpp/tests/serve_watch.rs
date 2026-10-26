@@ -210,6 +210,29 @@ fn a_build_from_elsewhere_is_picked_up_too() {
     let mut s = Server::start(&root, &["--no-watch"]);
     assert_eq!(s.def("helper", "src/main.c"), ["./src/util.c:2"]);
 
+    // A call hierarchy entry carries where the call is, not just who makes
+    // it: `main` calls `helper` at 2:25, and that is what the editor marks.
+    let at = |v: &Value| format!("{}:{}", v["line"], v["column"]);
+    let callers = s.request(json!({"op": "callers", "name": "helper", "file": "src/util.c"}));
+    assert_eq!(callers.len(), 1);
+    assert_eq!(callers[0]["name"], "main");
+    let calls: Vec<String> = callers[0]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(at)
+        .collect();
+    assert_eq!(calls, ["2:25"]);
+    let callees = s.request(json!({"op": "callees", "name": "main", "file": "src/main.c"}));
+    assert_eq!(callees[0]["name"], "helper");
+    let calls: Vec<String> = callees[0]["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(at)
+        .collect();
+    assert_eq!(calls, ["2:25"]);
+
     std::fs::write(
         root.join("src/later.c"),
         "#include \"util.h\"\nint later(void) { return 0; }\n",

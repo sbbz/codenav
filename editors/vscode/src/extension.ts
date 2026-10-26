@@ -26,6 +26,18 @@ function toLocation(l: Loc): vscode.Location {
   return new vscode.Location(vscode.Uri.file(absolute(l.path)), new vscode.Range(start, end));
 }
 
+/**
+ * Ranges of the calls a call hierarchy entry stands for. Falls back to
+ * `fallback` against a server too old to report them.
+ */
+function callRanges(l: Loc, fallback: vscode.Range): vscode.Range[] {
+  if (!l.calls || l.calls.length === 0) return [fallback];
+  return l.calls.map((c) => {
+    const start = new vscode.Position(Math.max(0, c.line - 1), Math.max(0, c.column - 1));
+    return new vscode.Range(start, start.translate(0, c.length));
+  });
+}
+
 function wordAt(doc: vscode.TextDocument, pos: vscode.Position): string | undefined {
   const range = doc.getWordRangeAtPosition(pos, /[A-Za-z_][A-Za-z0-9_]*/);
   return range ? doc.getText(range) : undefined;
@@ -225,7 +237,8 @@ class CallHierarchy implements vscode.CallHierarchyProvider {
           loc.range,
           loc.range,
         );
-        return new vscode.CallHierarchyIncomingCall(from, [loc.range]);
+        // Highlight the calls inside the caller, not the caller's own name.
+        return new vscode.CallHierarchyIncomingCall(from, callRanges(h, loc.range));
       }
     });
   }
@@ -250,7 +263,8 @@ class CallHierarchy implements vscode.CallHierarchyProvider {
           loc.range,
           loc.range,
         );
-        return new vscode.CallHierarchyOutgoingCall(to, [loc.range]);
+        // Ranges are in the calling function's document, i.e. `item`'s.
+        return new vscode.CallHierarchyOutgoingCall(to, callRanges(h, item.range));
       }
     });
   }
