@@ -1,0 +1,16 @@
+[package]
+name = "codenav-index"
+description = "Memory-mapped, write-once symbol index used by codenav"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+fst.workspace = true
+memmap2.workspace = true
+roaring.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true

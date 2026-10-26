@@ -1,0 +1,79 @@
+{
+  "name": "codenav",
+  "displayName": "codenav — fast C and Python navigation",
+  "description": "Fast C and Python code navigation with no build configuration.",
+  "version": "0.1.0",
+  "publisher": "codenav",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OWNER/codenav",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:python"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codenav.buildIndex",
+        "title": "codenav: Build/Rebuild Index",
+        "category": "codenav"
+      },
+      {
+        "command": "codenav.setArch",
+        "title": "codenav: Select Architecture",
+        "category": "codenav"
+      },
+      {
+        "command": "codenav.restart",
+        "title": "codenav: Restart Server",
+        "category": "codenav"
+      }
+    ],
+    "configuration": {
+      "title": "codenav",
+      "properties": {
+        "codenav.binaryPath": {
+          "type": "string",
+          "default": "codenav",
+          "description": "Path to the codenav binary. Defaults to whatever is on PATH."
+        },
+        "codenav.autoIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep the index current automatically: the server watches the workspace and re-indexes on every change, including edits made outside VS Code. Turn off to index only via codenav: Build/Rebuild Index."
+        },
+        "codenav.arch": {
+          "type": "string",
+          "default": "",
+          "description": "Preferred architecture, e.g. x86. Results under other arch/ directories are demoted. Empty means infer from the current file."
+        },
+        "codenav.maxReferences": {
+          "type": "number",
+          "default": 5000,
+          "description": "Cap on references returned for one symbol. Hot kernel symbols have tens of thousands."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  }
+}

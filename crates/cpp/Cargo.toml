@@ -1,0 +1,69 @@
+[package]
+name = "codenav-cpp"
+description = "Config-less C and Python code navigation: indexer, CLI and editor server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["c", "code-navigation", "indexer", "tree-sitter", "linux-kernel"]
+categories = ["development-tools", "command-line-utilities"]
+default-run = "codenav"
+
+[features]
+# Phase-0 measurement tools. Off by default so `cargo install` and a release
+# build produce only `codenav`; build them with `--features dev-tools`.
+dev-tools = []
+
+[dependencies]
+memchr.workspace = true
+rustc-hash.workspace = true
+roaring.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-python.workspace = true
+codenav-index = { path = "../index" }
+serde_json.workspace = true
+rayon.workspace = true
+ignore.workspace = true
+notify.workspace = true
+
+[lib]
+name = "codenav_cpp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codenav"
+path = "src/bin/codenav.rs"
+
+[[bin]]
+name = "scan-stats"
+path = "src/bin/scan_stats.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "expand-bench"
+path = "src/bin/expand_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "parse-bench"
+path = "src/bin/parse_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "tu-bench"
+path = "src/bin/tu_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "graph-bench"
+path = "src/bin/graph_bench.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "pipeline"
+path = "src/bin/pipeline.rs"
+required-features = ["dev-tools"]

@@ -1,0 +1,13 @@
+# Rust
+/target/
+
+# The index codenav writes into whatever tree it indexes, including this one
+.codenav/
+
+# VS Code extension build output
+editors/vscode/node_modules/
+editors/vscode/out/
+*.vsix
+
+# macOS
+.DS_Store

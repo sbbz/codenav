@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/cpp", "crates/index"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The locked `roaring` needs 1.90; std::fs::File::lock (build serialisation) 1.89.
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/OWNER/codenav"
+homepage = "https://github.com/OWNER/codenav"
+
+[workspace.dependencies]
+rayon = "1.10"
+ignore = "0.4"
+memchr = "2.7"
+rustc-hash = "2.1"
+fst = "0.4"
+memmap2 = "0.9"
+roaring = "0.11"
+serde_json = "1"
+notify = "8.2"
+tree-sitter = "0.26"
+tree-sitter-c = "0.24"
+tree-sitter-python = "0.25"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
