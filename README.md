@@ -1,6 +1,6 @@
 # codenav
 
-[![CI](https://github.com/OWNER/codenav/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/codenav/actions/workflows/ci.yml)
+[![CI](https://github.com/sbbz/codenav/actions/workflows/ci.yml/badge.svg)](https://github.com/sbbz/codenav/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Fast code navigation for C and Python. No build config. No setup.**
@@ -31,7 +31,7 @@ Jump to definitions, find references, walk call hierarchies — on codebases the
 | Fedora | `dnf install gcc` |
 
 ```bash
-git clone https://github.com/OWNER/codenav
+git clone https://github.com/sbbz/codenav
 cd codenav
 cargo install --locked --path crates/cpp
 ```

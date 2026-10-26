@@ -8,8 +8,8 @@ edition = "2021"
 # The locked `roaring` needs 1.90; std::fs::File::lock (build serialisation) 1.89.
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/OWNER/codenav"
-homepage = "https://github.com/OWNER/codenav"
+repository = "https://github.com/sbbz/codenav"
+homepage = "https://github.com/sbbz/codenav"
 
 [workspace.dependencies]
 rayon = "1.10"
