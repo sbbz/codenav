@@ -559,7 +559,7 @@ fn build_index(root: &Path) -> std::io::Result<()> {
             tot_parse as f64 / 1e6, pct(tot_parse),
             tot_extract as f64 / 1e6, pct(tot_extract),
         );
-        prof.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        prof.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         let top1pct: u64 = prof.iter().take(prof.len() / 100).map(|x| x.0).sum();
         eprintln!(
             "  slowest 1% of files account for {:.0}% of parse time",
