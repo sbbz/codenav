@@ -21,18 +21,35 @@ pub struct GlobalDef {
     /// identically in many headers and under many guards; those are one
     /// definition for navigation purposes, not competing variants.
     pub hash: u64,
+    /// `hash` plus the macro's name: what this definition contributes to its
+    /// file's export signature.
+    pub export: u64,
 }
 
-fn def_hash(d: &MacroDef) -> u64 {
+/// Hashes spellings, never `SymId`s. Ids depend on interning order, which
+/// differs between a full build (one interner over the whole tree) and the
+/// incremental check (a fresh one per changed file) — hashing ids made every
+/// header with a `#define` look as if its macros had changed on every save,
+/// forcing a full rebuild for a comment edit.
+fn def_hash<S: Symbols>(d: &MacroDef, it: &S) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     d.is_fn.hash(&mut h);
     d.variadic.hash(&mut h);
     d.undef.hash(&mut h);
-    d.params.hash(&mut h);
-    for t in &d.body {
-        t.sym.hash(&mut h);
+    for &p in &d.params {
+        it.text(p).hash(&mut h);
     }
+    for t in &d.body {
+        it.text(t.sym).hash(&mut h);
+    }
+    h.finish()
+}
+
+fn text_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    s.hash(&mut h);
     h.finish()
 }
 
@@ -49,15 +66,30 @@ pub struct LookupStats {
 }
 
 impl GlobalMacros {
-    pub fn insert(&mut self, name: SymId, file: FileId, def: MacroDef) {
+    pub fn insert<S: Symbols>(&mut self, name: SymId, file: FileId, def: MacroDef, it: &S) {
+        let hash = def_hash(&def, it);
+        let export = hash ^ text_hash(it.text(name)).wrapping_mul(0x9e3779b97f4a7c15);
+        self.insert_hashed(name, file, def, hash, export);
+    }
+
+    fn insert_hashed(&mut self, name: SymId, file: FileId, def: MacroDef, hash: u64, export: u64) {
         let v = self.defs.entry(name).or_default();
         // Same file and same guard means a re-scan, not a new variant.
         if let Some(slot) = v.iter_mut().find(|d| d.file == file && d.def.pc == def.pc) {
-            slot.def = def;
+            *slot = GlobalDef {
+                file,
+                def,
+                hash,
+                export,
+            };
             return;
         }
-        let hash = def_hash(&def);
-        v.push(GlobalDef { file, def, hash });
+        v.push(GlobalDef {
+            file,
+            def,
+            hash,
+            export,
+        });
     }
 
     /// Definitions of `name` visible from `from`, meaning defined in that file
@@ -153,7 +185,8 @@ impl GlobalMacros {
                     t.sym = sym[t.sym as usize];
                     t.pc = pc[t.pc as usize];
                 }
-                self.insert(gname, g.file, def);
+                // Spelling-based, so the hashes survive the id translation.
+                self.insert_hashed(gname, g.file, def, g.hash, g.export);
             }
         }
     }
@@ -186,14 +219,11 @@ impl GlobalMacros {
     /// dependent can extract differently, whatever else changed in the file.
     pub fn export_signatures(&self) -> FxHashMap<FileId, u64> {
         let mut per_file: FxHashMap<FileId, Vec<u64>> = FxHashMap::default();
-        for (&name, defs) in &self.defs {
+        for defs in self.defs.values() {
             for g in defs {
                 // Name and meaning together; the offset deliberately is not
                 // included, so moving a define down a file changes nothing.
-                per_file
-                    .entry(g.file)
-                    .or_default()
-                    .push(g.hash ^ (name as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                per_file.entry(g.file).or_default().push(g.export);
             }
         }
         per_file
@@ -371,7 +401,7 @@ pub fn collect_defines<S: Symbols>(
         if s == kw.define {
             if let Some((name, mut def)) = parse_define(expr, wk) {
                 def.pc = pc;
-                out.insert(name, file, def);
+                out.insert(name, file, def, it);
             }
         } else if s == kw.undef {
             if let Some(n) = expr.first() {
@@ -387,6 +417,7 @@ pub fn collect_defines<S: Symbols>(
                         pc,
                         undef: true,
                     },
+                    it,
                 );
             }
         } else if s == kw.if_ || s == kw.ifdef || s == kw.ifndef {
@@ -743,5 +774,70 @@ mod tests {
         collect_defines(0, &toks, &f.wk, &f.kw, &mut f.it, &mut f.pcs, &mut f.gm);
         let a = f.it.intern("A");
         assert_eq!(f.gm.all(a).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use crate::intern::Interner;
+    use crate::lex::lex;
+
+    /// Export signature of the last file in `files`, scanned in order with one
+    /// interner — so earlier files decide what ids its names get.
+    fn sig(files: &[&str]) -> u64 {
+        let mut it = Interner::new();
+        let wk = WellKnown::new(&mut it);
+        let kw = Keywords::new(&mut it);
+        let mut pcs = PcStore::new();
+        let mut gm = GlobalMacros::default();
+        for (i, src) in files.iter().enumerate() {
+            let toks = lex(src.as_bytes(), &mut it);
+            collect_defines(i as FileId, &toks, &wk, &kw, &mut it, &mut pcs, &mut gm);
+        }
+        gm.export_signatures()[&(files.len() as FileId - 1)]
+    }
+
+    const HEADER: &str = "/* a */\n#define LIMIT(x) ((x) + OFFSET)\n#define OFFSET 4\n";
+
+    #[test]
+    fn the_signature_does_not_depend_on_interning_order() {
+        // The regression: a full build interns the whole tree in one pass, the
+        // incremental check interns one file afresh. Hashing ids made the two
+        // disagree, so every save of a header with a #define looked like a
+        // macro change and forced a full rebuild.
+        let alone = sig(&[HEADER]);
+        let after_others = sig(&["#define OFFSET 9\nint x, LIMIT, zz;\n", HEADER]);
+        assert_eq!(alone, after_others);
+    }
+
+    #[test]
+    fn a_comment_or_a_move_is_not_a_macro_change() {
+        let base = sig(&[HEADER]);
+        assert_eq!(
+            base,
+            sig(&["/* edited */\n#define LIMIT(x) ((x) + OFFSET)\n#define OFFSET 4\n"])
+        );
+        assert_eq!(
+            base,
+            sig(&["\n\n#define OFFSET 4\n#define LIMIT(x) ((x) + OFFSET)\n"])
+        );
+    }
+
+    #[test]
+    fn a_changed_body_parameter_or_name_is() {
+        let base = sig(&[HEADER]);
+        assert_ne!(
+            base,
+            sig(&["#define LIMIT(x) ((x) + OFFSET)\n#define OFFSET 5\n"])
+        );
+        assert_ne!(
+            base,
+            sig(&["#define LIMIT(y) ((y) + OFFSET)\n#define OFFSET 4\n"])
+        );
+        assert_ne!(
+            base,
+            sig(&["#define LIMITS(x) ((x) + OFFSET)\n#define OFFSET 4\n"])
+        );
     }
 }

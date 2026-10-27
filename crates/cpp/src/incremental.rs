@@ -74,6 +74,7 @@ pub fn try_update(
 
     // Rescan only the changed files, to see whether the change escapes them.
     let mut changes = Vec::with_capacity(changed_paths.len());
+    let mut new_exports: rustc_hash::FxHashMap<&str, u64> = Default::default();
     for path in changed_paths {
         let Some(id) = ix.file_id(path) else {
             return Ok(Outcome::Fallback("changed file is not in the index"));
@@ -111,6 +112,7 @@ pub fn try_update(
         };
 
         let was = old_manifest.get(path);
+        new_exports.insert(path.as_str(), exports);
         changes.push(incr::FileChange {
             file: id,
             exports_changed: was.is_some_and(|f| f.exports != exports),
@@ -276,8 +278,10 @@ pub fn try_update(
     };
     store::publish(index_dir, &live)?;
 
-    // Refresh content hashes; exports and edges are unchanged by construction,
-    // since any change to them would have forced a full rebuild above.
+    // Refresh content hashes. Edges are unchanged by construction — any change
+    // forced a full rebuild above — but exports may have changed: that only
+    // dirtied the dependents. Record the new value, or the next edit would see
+    // the same change again and re-dirty them for nothing.
     let mut man = Manifest::default();
     for (path, scan) in hashes {
         let prev = old_manifest.get(path);
@@ -285,7 +289,10 @@ pub fn try_update(
             path.clone(),
             manifest::FileFacts {
                 content: scan.content,
-                exports: prev.map(|f| f.exports).unwrap_or(0),
+                exports: new_exports
+                    .get(path.as_str())
+                    .copied()
+                    .unwrap_or_else(|| prev.map(|f| f.exports).unwrap_or(0)),
                 edges: prev.map(|f| f.edges).unwrap_or(0),
                 mtime_ns: scan.mtime_ns,
                 size: scan.size,
