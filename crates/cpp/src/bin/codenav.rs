@@ -41,6 +41,10 @@ fn main() -> ExitCode {
     };
 
     match cmd {
+        "version" | "--version" | "-V" => {
+            println!("codenav {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         "index" => {
             let root = args
                 .iter()
@@ -167,7 +171,8 @@ fn usage() {
          \x20 codenav sym <prefix>     find symbols by prefix\n\
          \x20 codenav serve            line-delimited JSON over stdio; watches\n\
          \x20                          the tree unless --no-watch\n\
-         \x20 codenav diagnose <file>  show where the parse breaks (--dump for text)\n\n\
+         \x20 codenav diagnose <file>  show where the parse breaks (--dump for text)\n\
+         \x20 codenav version          print the version\n\n\
          ranking:\n\
          \x20 --from <file>            rank by what <file> actually includes\n\
          \x20 --arch <name>            prefer arch/<name>/ over other arches"
