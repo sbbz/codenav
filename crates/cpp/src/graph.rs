@@ -86,6 +86,9 @@ pub struct IncludeGraph {
     pub edges: Vec<Vec<FileId>>,
     pub unresolved: u64,
     pub resolved: u64,
+    /// Each include that resolved to nothing, as `(file, angled, target)`.
+    /// Kept so an update can tell when a newly added header satisfies one.
+    pub missing: Vec<(FileId, bool, String)>,
 }
 
 impl IncludeGraph {
@@ -94,6 +97,7 @@ impl IncludeGraph {
             edges: vec![Vec::new(); n],
             unresolved: 0,
             resolved: 0,
+            missing: Vec::new(),
         }
     }
 
@@ -104,27 +108,12 @@ impl IncludeGraph {
         reg: &FileRegistry,
         resolver: &Resolver,
     ) {
-        let dir = reg
-            .path(from)
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_default();
-        for inc in incs {
-            match resolver
-                .resolve(reg, &dir, &inc.target, inc.angled)
-                .or_else(|| resolver.resolve_by_suffix(reg, &inc.target))
-            {
-                Some(to) => {
-                    self.resolved += 1;
-                    if to != from {
-                        self.edges[from as usize].push(to);
-                    }
-                }
-                None => self.unresolved += 1,
-            }
-        }
-        self.edges[from as usize].sort_unstable();
-        self.edges[from as usize].dedup();
+        let (edges, missing) = resolve_includes(from, incs, reg, resolver);
+        self.resolved += (incs.len() - missing.len()) as u64;
+        self.unresolved += missing.len() as u64;
+        self.missing
+            .extend(missing.into_iter().map(|(a, t)| (from, a, t)));
+        self.edges[from as usize] = edges;
     }
 
     /// Transitive include closure of every file, computed in DFS post-order so
@@ -201,6 +190,37 @@ impl ClosureStats {
     pub fn mean_closure(&self) -> f64 {
         self.total_entries as f64 / self.files.max(1) as f64
     }
+}
+
+/// Resolves one file's includes: the sorted, deduplicated files they reach, and
+/// `(angled, target)` for each that reaches nothing. Shared by the full build
+/// and by updates, which must resolve exactly alike or their closures differ.
+pub fn resolve_includes(
+    from: FileId,
+    incs: &[RawInclude],
+    reg: &FileRegistry,
+    resolver: &Resolver,
+) -> (Vec<FileId>, Vec<(bool, String)>) {
+    let dir = reg
+        .path(from)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let mut edges = Vec::new();
+    let mut missing = Vec::new();
+    for inc in incs {
+        match resolver
+            .resolve(reg, &dir, &inc.target, inc.angled)
+            .or_else(|| resolver.resolve_by_suffix(reg, &inc.target))
+        {
+            Some(to) if to != from => edges.push(to),
+            Some(_) => {}
+            None => missing.push((inc.angled, inc.target.clone())),
+        }
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    (edges, missing)
 }
 
 #[cfg(test)]

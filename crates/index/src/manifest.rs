@@ -18,7 +18,7 @@ use std::path::Path;
 
 /// Bumped whenever the on-disk layout changes, so a stale manifest is ignored
 /// rather than misread.
-pub const MANIFEST_VERSION: u32 = 2;
+pub const MANIFEST_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FileFacts {

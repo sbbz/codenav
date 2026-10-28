@@ -43,10 +43,21 @@ fn main() -> ExitCode {
     match cmd {
         "index" => {
             let root = args
-                .get(1)
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
-            match build_index(&root) {
+            // The watcher names the files that changed, one per line, so the
+            // build can skip walking the tree. Not meant to be typed.
+            let hint = args.iter().any(|a| a == "--paths-from-stdin").then(|| {
+                std::io::stdin()
+                    .lines()
+                    .map_while(Result::ok)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<String>>()
+            });
+            match build_index(&root, hint) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("index failed: {e}");
@@ -184,7 +195,7 @@ fn index_dir() -> PathBuf {
     locate().1
 }
 
-fn build_index(root: &Path) -> std::io::Result<()> {
+fn build_index(root: &Path, hint: Option<Vec<String>>) -> std::io::Result<()> {
     let t_all = Instant::now();
 
     // Held to the end, so a second build — the server's watcher and a terminal,
@@ -194,9 +205,76 @@ fn build_index(root: &Path) -> std::io::Result<()> {
         eprintln!("waiting for another codenav build to finish...")
     })?;
 
+    // An index from before generations existed is rebuilt rather than updated:
+    // the incremental path only knows how to publish on top of a generation.
+    let old = match store::current(&out_dir) {
+        Ok(Some(_)) => manifest::Manifest::load(&out_dir),
+        _ => None,
+    };
+
+    // With every changed file named, re-stat just those against the manifest
+    // instead of walking the tree. Only when the manifest names files the way
+    // this walk would (`./a/b.c`, from `codenav index .`).
+    let mut fell_back = false;
+    if let (Some(hint), Some(m)) = (hint, &old) {
+        if root == Path::new(".") && m.files.keys().next().is_some_and(|k| k.starts_with("./")) {
+            let t = Instant::now();
+            let mut scans: FxHashMap<String, manifest::Scan> = m
+                .files
+                .iter()
+                .map(|(p, f)| {
+                    let s = manifest::Scan {
+                        content: f.content,
+                        mtime_ns: f.mtime_ns,
+                        size: f.size,
+                    };
+                    (p.clone(), s)
+                })
+                .collect();
+            let named = hint.len();
+            for p in hint {
+                let path = Path::new(&p);
+                match (is_source(path) && path.is_file())
+                    .then(|| manifest::rescan(path, m.get(&p)))
+                    .flatten()
+                {
+                    Some(s) => scans.insert(p, s),
+                    None => scans.remove(&p),
+                };
+            }
+            let hashes: Vec<(String, manifest::Scan)> = scans.into_iter().collect();
+            let changes = manifest::diff(m, &hashes);
+            if changes.is_empty() {
+                eprintln!("index up to date ({named} changed path(s) checked)");
+                return Ok(());
+            }
+            eprintln!(
+                "changed: {} modified, {} added, {} removed ({named} path(s) from the watcher, checked in {:.2}s)",
+                changes.modified.len(),
+                changes.added.len(),
+                changes.removed.len(),
+                t.elapsed().as_secs_f64()
+            );
+            let t = Instant::now();
+            match codenav_cpp::incremental::try_update(&out_dir, &changes, &hashes, m)? {
+                codenav_cpp::incremental::Outcome::Applied { files } => {
+                    eprintln!(
+                        "incremental: {files} file(s) re-indexed in {:.2}s",
+                        t.elapsed().as_secs_f64()
+                    );
+                    return Ok(());
+                }
+                codenav_cpp::incremental::Outcome::Fallback(why) => {
+                    eprintln!("full rebuild: {why}");
+                    fell_back = true;
+                }
+            }
+        }
+    }
+
+    // No filters: every source under the root, exactly as the watcher sees it.
     let paths: Vec<PathBuf> = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(false)
+        .standard_filters(false)
         .build()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
@@ -231,12 +309,6 @@ fn build_index(root: &Path) -> std::io::Result<()> {
     // without doing any work at all.
     let all_paths: Vec<&PathBuf> = paths.iter().chain(py_paths.iter()).collect();
     let t = Instant::now();
-    // An index from before generations existed is rebuilt rather than updated:
-    // the incremental path only knows how to publish on top of a generation.
-    let old = match store::current(&out_dir) {
-        Ok(Some(_)) => manifest::Manifest::load(&out_dir),
-        _ => None,
-    };
     let hashes: Vec<(String, manifest::Scan)> = all_paths
         .par_iter()
         .filter_map(|p| {
@@ -253,7 +325,7 @@ fn build_index(root: &Path) -> std::io::Result<()> {
             ..Default::default()
         });
 
-    if old.is_some() && changes.is_empty() {
+    if old.is_some() && changes.is_empty() && !fell_back {
         eprintln!(
             "index up to date ({} files checked in {:.1}s)",
             hashes.len(),
@@ -261,7 +333,7 @@ fn build_index(root: &Path) -> std::io::Result<()> {
         );
         return Ok(());
     }
-    if let Some(old_man) = &old {
+    if let Some(old_man) = old.as_ref().filter(|_| !fell_back) {
         eprintln!(
             "changed: {} modified, {} added, {} removed (checked in {:.1}s)",
             changes.modified.len(),
@@ -270,26 +342,17 @@ fn build_index(root: &Path) -> std::io::Result<()> {
             t.elapsed().as_secs_f64()
         );
 
-        // Only a pure modification set can be applied incrementally: an added
-        // or removed file shifts FileIds, which the overlay cannot express.
-        if changes.added.is_empty() && changes.removed.is_empty() {
-            let t = Instant::now();
-            match codenav_cpp::incremental::try_update(
-                &out_dir,
-                &changes.modified,
-                &hashes,
-                old_man,
-            )? {
-                codenav_cpp::incremental::Outcome::Applied { files } => {
-                    eprintln!(
-                        "incremental: {files} file(s) re-indexed in {:.2}s",
-                        t.elapsed().as_secs_f64()
-                    );
-                    return Ok(());
-                }
-                codenav_cpp::incremental::Outcome::Fallback(why) => {
-                    eprintln!("full rebuild: {why}");
-                }
+        let t = Instant::now();
+        match codenav_cpp::incremental::try_update(&out_dir, &changes, &hashes, old_man)? {
+            codenav_cpp::incremental::Outcome::Applied { files } => {
+                eprintln!(
+                    "incremental: {files} file(s) re-indexed in {:.2}s",
+                    t.elapsed().as_secs_f64()
+                );
+                return Ok(());
+            }
+            codenav_cpp::incremental::Outcome::Fallback(why) => {
+                eprintln!("full rebuild: {why}");
             }
         }
     }
@@ -311,6 +374,9 @@ fn build_index(root: &Path) -> std::io::Result<()> {
     // unexplained index difference for 12s of a 90s build.
     let t = Instant::now();
     let mut all_includes: Vec<Vec<RawInclude>> = (0..reg.len()).map(|_| Vec::new()).collect();
+    // Each file's directive lines, so an update can read its closure's
+    // macros without re-lexing ~1,000 headers.
+    let mut directives: Vec<Vec<u8>> = vec![Vec::new(); reg.len()];
     let mut targets: FxHashMap<String, u32> = FxHashMap::default();
 
     let pg = Progress::new("scan", paths.len());
@@ -326,6 +392,7 @@ fn build_index(root: &Path) -> std::io::Result<()> {
         }
         collect_defines(i as FileId, &toks, &wk, &kw, &mut it, &mut pcs, &mut gm);
         all_includes[i] = incs;
+        directives[i] = codenav_cpp::directives::encode(&toks, &wk, &it);
     }
     pg.finish();
     eprintln!(
@@ -360,6 +427,9 @@ fn build_index(root: &Path) -> std::io::Result<()> {
         }
     }
     let (mut closures, _) = g.closures();
+    // Stored so an update can recompute closures after an include changes.
+    let mut edges = g.edges.clone();
+    let missing = std::mem::take(&mut g.missing);
     eprintln!(
         "resolved includes in {:.1}s ({} roots, {} edges)",
         t.elapsed().as_secs_f64(),
@@ -603,6 +673,8 @@ fn build_index(root: &Path) -> std::io::Result<()> {
         t.elapsed().as_secs_f64()
     );
 
+    let mut py_roots: Vec<String> = Vec::new();
+    let mut py_missing: Vec<(u32, u32, String)> = Vec::new();
     // ---- Python phase ----
     // No preprocessor, so no macro table and no expansion: each file is parsed
     // once and yields its symbols and its imports together. The import graph is
@@ -714,6 +786,11 @@ fn build_index(root: &Path) -> std::io::Result<()> {
             }
         }
         let py_resolver = Resolver::infer(&reg, &py_targets);
+        py_roots = py_resolver
+            .roots()
+            .iter()
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect();
 
         let mut pyg = IncludeGraph::with_capacity(reg.len());
         let (mut resolved, mut unresolved) = (0u64, 0u64);
@@ -733,7 +810,10 @@ fn build_index(root: &Path) -> std::io::Result<()> {
                     }
                     // Third-party and stdlib-external imports simply are not in
                     // the tree; that is expected, not an error.
-                    None => unresolved += 1,
+                    None => {
+                        unresolved += 1;
+                        py_missing.push((*file, imp.level, imp.path.clone()));
+                    }
                 }
             }
             pyg.edges[*file as usize].sort_unstable();
@@ -749,7 +829,8 @@ fn build_index(root: &Path) -> std::io::Result<()> {
         // Python file ids occupy the tail of the registry, so only that range
         // is replaced; the C closures computed earlier stay untouched.
         let tail = py_base as usize..reg.len();
-        closures[tail.clone()].clone_from_slice(&py_closures[tail]);
+        closures[tail.clone()].clone_from_slice(&py_closures[tail.clone()]);
+        edges[tail.clone()].clone_from_slice(&pyg.edges[tail]);
 
         pg.finish();
         eprintln!(
@@ -764,6 +845,10 @@ fn build_index(root: &Path) -> std::io::Result<()> {
     }
 
     w.set_closures(closures);
+    w.set_edges(edges);
+    w.set_unresolved(missing);
+    w.set_directives(directives);
+    w.set_python_imports(py_roots, py_missing);
 
     let out = out_dir;
     let t = Instant::now();

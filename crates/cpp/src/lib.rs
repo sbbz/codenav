@@ -1,3 +1,4 @@
+pub mod directives;
 pub mod expand;
 pub mod files;
 pub mod global;

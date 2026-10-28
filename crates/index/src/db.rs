@@ -19,6 +19,9 @@ use std::path::Path;
 /// Where a pre-generation index kept its overlay.
 const OVERLAY_DIR: &str = "overlay";
 pub const TOMBSTONES: &str = "tombstones.bin";
+/// Overlay bitmaps; see [`Db`].
+pub const REMOVED: &str = "removed";
+pub const CLOSURE_OVERRIDES: &str = "closure_overrides";
 
 /// A symbol together with its resolved name.
 ///
@@ -50,6 +53,12 @@ pub struct Db {
     overlay: Option<Index>,
     /// FileIds whose records in `main` have been superseded by the overlay.
     tombstones: RoaringBitmap,
+    /// Files deleted since `main` was built. Tombstoned with nothing in their
+    /// place, and no longer found by path.
+    removed: RoaringBitmap,
+    /// Files whose include closure an update recomputed; the overlay holds
+    /// the current one.
+    closure_overrides: RoaringBitmap,
 }
 
 impl Db {
@@ -91,10 +100,16 @@ impl Db {
             }
             None => (None, RoaringBitmap::new()),
         };
+        let (removed, closure_overrides) = match &overlay {
+            Some(o) => (o.bitmap(REMOVED)?, o.bitmap(CLOSURE_OVERRIDES)?),
+            None => Default::default(),
+        };
         Ok(Self {
             main,
             overlay,
             tombstones,
+            removed,
+            closure_overrides,
         })
     }
 
@@ -105,6 +120,8 @@ impl Db {
             main: Index::open(dir)?,
             overlay: Index::open(&dir.join(OVERLAY_DIR)).ok(),
             tombstones: Self::load_tombstones(dir).unwrap_or_default(),
+            removed: RoaringBitmap::new(),
+            closure_overrides: RoaringBitmap::new(),
         })
     }
 
@@ -121,6 +138,22 @@ impl Db {
 
     pub fn overlay_files(&self) -> u64 {
         self.tombstones.len()
+    }
+
+    pub fn overlay(&self) -> Option<&Index> {
+        self.overlay.as_ref()
+    }
+
+    pub fn tombstones(&self) -> &RoaringBitmap {
+        &self.tombstones
+    }
+
+    pub fn removed(&self) -> &RoaringBitmap {
+        &self.removed
+    }
+
+    pub fn closure_overrides(&self) -> &RoaringBitmap {
+        &self.closure_overrides
     }
 
     pub fn main(&self) -> &Index {
@@ -141,26 +174,41 @@ impl Db {
         self.main.symbol_count() + self.overlay.as_ref().map_or(0, |o| o.symbol_count())
     }
 
+    /// Includes files added since `main` was built, which only the overlay's
+    /// path table knows.
     pub fn file_count(&self) -> usize {
-        self.main.file_count()
+        self.overlay
+            .as_ref()
+            .map_or(0, |o| o.file_count())
+            .max(self.main.file_count())
     }
 
     /// Paths are identical in both shards, so the main one answers.
     pub fn path(&self, id: FileId) -> Option<&str> {
+        if id as usize >= self.main.file_count() {
+            return self.overlay.as_ref()?.path(id);
+        }
         self.main.path(id)
     }
 
     pub fn file_id(&self, path: &str) -> Option<FileId> {
-        self.main.file_id(path)
+        let id = self
+            .main
+            .file_id(path)
+            .or_else(|| self.overlay.as_ref()?.file_id(path))?;
+        (!self.removed.contains(id)).then_some(id)
     }
 
     pub fn root_rank(&self, path: &str) -> Option<usize> {
         self.main.root_rank(path)
     }
 
-    /// Include closures are only rebuilt when edges change, and an edge change
-    /// forces a full rebuild — so the main shard is always authoritative here.
+    /// The overlay's copy when an update recomputed it — after an include was
+    /// added or removed, or a file appeared — and main's otherwise.
     pub fn closure(&self, file: FileId) -> Option<RoaringBitmap> {
+        if self.closure_overrides.contains(file) {
+            return self.overlay.as_ref()?.closure(file);
+        }
         self.main.closure(file)
     }
 

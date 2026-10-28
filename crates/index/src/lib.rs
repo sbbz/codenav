@@ -216,6 +216,23 @@ pub struct IndexWriter {
     /// Inferred include roots, best-voted first. A definition under the
     /// canonical root is more authoritative than one in a driver or sample.
     roots: Vec<String>,
+    /// Direct include/import edges per file. Closures are derived from these,
+    /// so storing them is what lets an update recompute closures after an
+    /// `#include` changes instead of rebuilding everything.
+    edges: Option<Vec<Vec<u32>>>,
+    /// Includes that resolved to nothing: `(file, angled, target)`. A header
+    /// added later may satisfy one in a file nobody touched.
+    unresolved: Vec<(u32, bool, String)>,
+    /// The same for Python: `(file, level, module path)`, plus the roots the
+    /// import resolver inferred, which an update needs to resolve alike.
+    unresolved_py: Vec<(u32, u32, String)>,
+    py_roots: Vec<String>,
+    /// Each file's preprocessor directives, pre-lexed and encoded by the
+    /// caller. An update reads its closure's macros from here instead of
+    /// re-lexing ~1,000 whole files.
+    directives: Option<Vec<Vec<u8>>>,
+    /// Named per-file sets, such as an overlay's tombstones.
+    bitmaps: Vec<(String, RoaringBitmap)>,
 }
 
 impl IndexWriter {
@@ -267,6 +284,31 @@ impl IndexWriter {
 
     pub fn set_roots(&mut self, r: Vec<String>) {
         self.roots = r;
+    }
+
+    pub fn set_edges(&mut self, e: Vec<Vec<u32>>) {
+        self.edges = Some(e);
+    }
+
+    pub fn set_unresolved(&mut self, u: Vec<(u32, bool, String)>) {
+        self.unresolved = u;
+    }
+
+    pub fn set_python_imports(&mut self, roots: Vec<String>, unresolved: Vec<(u32, u32, String)>) {
+        self.py_roots = roots;
+        self.unresolved_py = unresolved;
+    }
+
+    pub fn set_directives(&mut self, d: Vec<Vec<u8>>) {
+        self.directives = Some(d);
+    }
+
+    pub fn add_bitmap(&mut self, name: &str, b: RoaringBitmap) {
+        self.bitmaps.push((name.to_string(), b));
+    }
+
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
     }
 
     pub fn write(self, dir: &Path) -> io::Result<IndexStats> {
@@ -433,6 +475,52 @@ impl IndexWriter {
         write_u32s(dir.join("pcs.idx"), &qoff)?;
         write_u32s(dir.join("pcs.bin"), &qbuf)?;
 
+        if let Some(edges) = &self.edges {
+            Csr::build(self.paths.len(), || {
+                edges
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(f, ts)| ts.iter().map(move |&t| (f, t)))
+            })
+            .write(dir, "edges")?;
+            let mut u = String::new();
+            for (f, angled, target) in &self.unresolved {
+                u.push_str(&format!("{f}\t{}\t{target}\n", *angled as u8));
+            }
+            write_bytes(dir.join("unresolved.tsv"), u.as_bytes())?;
+            let mut u = String::new();
+            for (f, level, path) in &self.unresolved_py {
+                u.push_str(&format!("{f}\t{level}\t{path}\n"));
+            }
+            write_bytes(dir.join("unresolved_py.tsv"), u.as_bytes())?;
+            write_bytes(
+                dir.join("py_roots.txt"),
+                self.py_roots.join("\n").as_bytes(),
+            )?;
+        }
+
+        // Offsets are u64: the kernel's directives alone approach a gigabyte.
+        if let Some(dirs) = &self.directives {
+            let mut off: Vec<u8> = Vec::with_capacity((dirs.len() + 1) * 8);
+            let mut f =
+                BufWriter::with_capacity(1 << 20, File::create(dir.join("directives.bin"))?);
+            let mut at = 0u64;
+            for d in dirs {
+                off.extend_from_slice(&at.to_le_bytes());
+                f.write_all(d)?;
+                at += d.len() as u64;
+            }
+            off.extend_from_slice(&at.to_le_bytes());
+            f.flush()?;
+            write_bytes(dir.join("directives.idx"), &off)?;
+        }
+
+        for (name, b) in &self.bitmaps {
+            let mut buf = Vec::new();
+            b.serialize_into(&mut buf)?;
+            write_bytes(dir.join(format!("{name}.bm")), &buf)?;
+        }
+
         Ok(IndexStats {
             names: n_names,
             files: self.paths.len(),
@@ -525,6 +613,10 @@ pub struct Index {
     pcs: Mmap,
     pcs_idx: Mmap,
     roots: Vec<String>,
+    /// Absent in an index written before these existed.
+    edges: Option<Csr>,
+    directives: Option<(Mmap, Mmap)>,
+    dir: PathBuf,
 }
 
 impl Index {
@@ -553,7 +645,85 @@ impl Index {
                 .lines()
                 .map(|l| l.to_string())
                 .collect(),
+            edges: Csr::open(dir, "edges").ok(),
+            directives: map(dir.join("directives.idx"))
+                .and_then(|i| Ok((i, map(dir.join("directives.bin"))?)))
+                .ok(),
+            dir: dir.to_path_buf(),
         })
+    }
+
+    /// Whether this index stores direct edges, which updates that change the
+    /// include graph need.
+    pub fn has_edges(&self) -> bool {
+        self.edges.is_some()
+    }
+
+    /// Direct include/import targets of a file.
+    pub fn edges(&self, file: FileId) -> Vec<FileId> {
+        self.edges
+            .as_ref()
+            .map(|e| e.get(file as usize))
+            .unwrap_or_default()
+    }
+
+    /// Includes that resolved to nothing when this index was built.
+    pub fn unresolved(&self) -> Vec<(FileId, bool, String)> {
+        let text = std::fs::read_to_string(self.dir.join("unresolved.tsv")).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| {
+                let mut it = l.splitn(3, '\t');
+                let f = it.next()?.parse().ok()?;
+                let angled = it.next()? == "1";
+                Some((f, angled, it.next()?.to_string()))
+            })
+            .collect()
+    }
+
+    /// Python imports that resolved to nothing: `(file, level, module path)`.
+    pub fn unresolved_py(&self) -> Vec<(FileId, u32, String)> {
+        let text = std::fs::read_to_string(self.dir.join("unresolved_py.tsv")).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| {
+                let mut it = l.splitn(3, '\t');
+                Some((
+                    it.next()?.parse().ok()?,
+                    it.next()?.parse().ok()?,
+                    it.next()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Roots the Python import resolver inferred.
+    pub fn py_roots(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("py_roots.txt"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A file's encoded directives, as handed to the writer.
+    pub fn directives(&self, file: FileId) -> Option<&[u8]> {
+        let (idx, bin) = self.directives.as_ref()?;
+        let i = file as usize * 8;
+        if i + 16 > idx.len() {
+            return None;
+        }
+        let s = u64::from_le_bytes(idx[i..i + 8].try_into().ok()?) as usize;
+        let e = u64::from_le_bytes(idx[i + 8..i + 16].try_into().ok()?) as usize;
+        bin.get(s..e)
+    }
+
+    /// A named set written with [`IndexWriter::add_bitmap`]; empty if absent.
+    pub fn bitmap(&self, name: &str) -> io::Result<RoaringBitmap> {
+        match std::fs::read(self.dir.join(format!("{name}.bm"))) {
+            Ok(b) => RoaringBitmap::deserialize_from(&b[..]),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RoaringBitmap::new()),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn name_id(&self, name: &str) -> Option<NameId> {
@@ -747,6 +917,11 @@ impl Index {
     /// Symbols declared in a file, in index order. Their `enclosing` fields
     /// point within this same run, so the run can be relocated by shifting
     /// them uniformly.
+    /// Ids of a file's symbols, in order.
+    pub fn symbol_ids_in_file(&self, file: FileId) -> Vec<SymbolId> {
+        self.sym_by_file.get(file as usize)
+    }
+
     pub fn symbols_in_file(&self, file: FileId) -> Vec<SymbolRec> {
         self.sym_by_file
             .get(file as usize)

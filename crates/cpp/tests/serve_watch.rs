@@ -64,9 +64,17 @@ impl Server {
     /// Fails if a build starts with nothing having changed. A build reads every
     /// source file, and counting those reads as changes made each build start
     /// the next one, forever.
+    ///
+    /// One trailing build is allowed: FSEvents can deliver the writes that
+    /// created the tree, made just before the server started watching. A loop
+    /// keeps going, so a second unprompted build fails.
     fn assert_settles(&self) {
-        if let Ok(v) = self.lines.recv_timeout(Duration::from_millis(1500)) {
-            panic!("a build started with nothing changed: {v}");
+        for allowed in [true, false] {
+            let Ok(v) = self.lines.recv_timeout(Duration::from_millis(1500)) else {
+                return;
+            };
+            assert!(allowed, "builds keep starting with nothing changed: {v}");
+            self.indexed();
         }
     }
 
@@ -167,32 +175,42 @@ fn the_server_follows_edits_without_a_restart() {
     s.indexed();
     assert!(s.def("renamed", "src/main.c").is_empty());
 
-    // A new file: FileIds shift, so this takes the full-rebuild path.
+    // A new file gets an id past the end of the table: still incremental.
     std::fs::write(
         root.join("src/extra.c"),
         "#include \"util.h\"\nint extra(void) { return helper(2); }\n",
     )
     .unwrap();
-    s.indexed();
+    let ev = s.indexed();
+    assert!(
+        ev["summary"].as_str().unwrap().contains("incremental"),
+        "{ev}"
+    );
     assert_eq!(s.def("extra", "src/main.c"), ["./src/extra.c:2"]);
     let callers = s.request(json!({"op": "callers", "name": "helper", "file": "src/main.c"}));
     assert!(callers.iter().any(|c| c["name"] == "extra"), "{callers:?}");
 
     // And a deleted one disappears.
     std::fs::remove_file(root.join("src/extra.c")).unwrap();
-    s.indexed();
+    let ev = s.indexed();
+    assert!(
+        ev["summary"].as_str().unwrap().contains("incremental"),
+        "{ev}"
+    );
     assert!(s.def("extra", "src/main.c").is_empty());
 
-    // Superseded generations do not pile up on disk.
-    let gens = std::fs::read_dir(root.join(".codenav"))
+    // Superseded generations do not pile up on disk: only what CURRENT
+    // names — main and its overlay — is left.
+    let current = std::fs::read_to_string(root.join(".codenav/CURRENT")).unwrap();
+    let mut gens: Vec<String> = std::fs::read_dir(root.join(".codenav"))
         .unwrap()
-        .filter(|e| {
-            let n = e.as_ref().unwrap().file_name();
-            let n = n.to_string_lossy();
-            n.starts_with("main-") || n.starts_with("overlay-")
-        })
-        .count();
-    assert_eq!(gens, 1, "only the live generation should remain");
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("main-") || n.starts_with("overlay-"))
+        .collect();
+    gens.sort();
+    let mut named: Vec<String> = current.lines().map(str::to_string).collect();
+    named.sort();
+    assert_eq!(gens, named);
 }
 
 #[test]

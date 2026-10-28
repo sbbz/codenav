@@ -1,10 +1,13 @@
 //! Rebuilds the index whenever the tree changes.
 //!
-//! Filesystem events are only a trigger. Every rebuild is an ordinary
-//! `codenav index`, which re-stats the whole tree against the manifest, so a
-//! dropped, coalesced or misattributed event can delay an update but never lose
-//! one. That is what makes it safe to filter events loosely and to fold a burst
-//! — a branch switch touches thousands of files — into a single build.
+//! Events say which source files changed, and the build re-stats only those
+//! instead of walking the whole tree — about 0.45 s of a one-file update on the
+//! kernel. Anything an event cannot pin to a file falls back to the walk: a
+//! directory renamed or deleted (often with no per-file events), something that
+//! vanished and may have been a directory, a backend asking for a rescan, or an
+//! error. The walk re-stats everything against the manifest, so a dropped or
+//! coalesced event there can delay an update but never lose one. A burst — a
+//! branch switch touches thousands of files — becomes a single build.
 //!
 //! The build runs as a child process rather than on a thread. A full rebuild's
 //! peak memory would otherwise stay with a long-lived server after the build
@@ -13,6 +16,8 @@
 use crate::files::is_source;
 use crate::INDEX_DIR;
 use notify::{EventKind, RecursiveMode, Watcher as _};
+use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -53,26 +58,33 @@ pub fn start(root: &Path, on_status: impl Fn(Status) + Send + 'static) -> notify
     // so filtering against a non-canonical root would match nothing.
     let canon = root.canonicalize()?;
 
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<Change>();
     let filter_root = canon.clone();
     let mut inner = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let trigger = match res {
-            Ok(ev) => wanted(&filter_root, &ev),
-            // An error can mean events were dropped; a build is the safe answer.
-            Err(_) => true,
-        };
-        if trigger {
-            let _ = tx.send(());
+        match res {
+            Ok(ev) => {
+                for c in classify(&filter_root, &ev) {
+                    let _ = tx.send(c);
+                }
+            }
+            // An error can mean events were dropped; walking is the safe answer.
+            Err(_) => {
+                let _ = tx.send(Change::Walk);
+            }
         }
     })?;
     inner.watch(&canon, RecursiveMode::Recursive)?;
 
     std::thread::spawn(move || {
-        let mut startup = true;
+        // The first build walks, to catch up on anything that changed while
+        // nothing was watching.
+        let mut walk = true;
+        let mut paths: BTreeSet<String> = BTreeSet::new();
         loop {
-            if !startup {
-                if rx.recv().is_err() {
-                    return;
+            if !walk {
+                match rx.recv() {
+                    Ok(c) => take(c, &mut walk, &mut paths),
+                    Err(_) => return,
                 }
                 let first = Instant::now();
                 loop {
@@ -81,65 +93,105 @@ pub fn start(root: &Path, on_status: impl Fn(Status) + Send + 'static) -> notify
                         break;
                     }
                     match rx.recv_timeout(QUIET.min(left)) {
-                        Ok(()) => {}
+                        Ok(c) => take(c, &mut walk, &mut paths),
                         Err(RecvTimeoutError::Timeout) => break,
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
             }
-            startup = false;
+            let hint = (!walk).then(|| std::mem::take(&mut paths));
+            walk = false;
+            paths.clear();
             // Anything arriving from here on queues up and triggers one more
             // build afterwards, so a change made mid-build is never missed.
             on_status(Status::Indexing);
-            on_status(build(&root));
+            on_status(build(&root, hint));
         }
     });
 
     Ok(Watcher { _inner: inner })
 }
 
-/// Whether an event should trigger a build.
-fn wanted(root: &Path, ev: &notify::Event) -> bool {
+/// What an event means for the next build.
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    /// This source file changed, named as the walk would name it (`./a/b.c`).
+    Path(String),
+    /// Something changed that only a walk of the tree can account for.
+    Walk,
+}
+
+fn take(c: Change, walk: &mut bool, paths: &mut BTreeSet<String>) {
+    match c {
+        Change::Walk => *walk = true,
+        Change::Path(p) => {
+            paths.insert(p);
+        }
+    }
+}
+
+fn classify(root: &Path, ev: &notify::Event) -> Vec<Change> {
     // inotify reports opens and reads, and a build reads every source file —
     // so counting them made each build trigger the next, forever. A write is
     // always also reported as a modify or create, so nothing real is lost.
     if matches!(ev.kind, EventKind::Access(_)) {
-        return false;
+        return Vec::new();
     }
-    ev.need_rescan() || ev.paths.iter().any(|p| relevant(root, p))
+    if ev.need_rescan() {
+        return vec![Change::Walk];
+    }
+    ev.paths
+        .iter()
+        .filter_map(|p| classify_path(root, p))
+        .collect()
 }
 
-/// Whether an event at `p` could change the index.
-fn relevant(root: &Path, p: &Path) -> bool {
-    let rel = p.strip_prefix(root).unwrap_or(p);
+fn classify_path(root: &Path, p: &Path) -> Option<Change> {
+    let Ok(rel) = p.strip_prefix(root) else {
+        return Some(Change::Walk);
+    };
     if rel
         .components()
         .any(|c| c.as_os_str() == INDEX_DIR || c.as_os_str() == ".git")
     {
-        return false;
+        return None;
     }
     if is_source(p) {
-        return true;
+        return Some(Change::Path(
+            Path::new(".").join(rel).to_string_lossy().into_owned(),
+        ));
     }
     // Renaming or deleting a directory moves every file under it, often with
     // no per-file events. A path that is gone may have been one.
-    p.is_dir() || !p.exists()
+    (p.is_dir() || !p.exists()).then_some(Change::Walk)
 }
 
-fn build(root: &Path) -> Status {
+/// Runs `codenav index .`, handing it the changed paths when events named
+/// them all, so it can skip the walk.
+fn build(root: &Path, hint: Option<BTreeSet<String>>) -> Status {
     let t = Instant::now();
     let log_path = root.join(INDEX_DIR).join(LOG);
     let ran = (|| {
         std::fs::create_dir_all(root.join(INDEX_DIR))?;
         let log = std::fs::File::create(&log_path)?;
-        Command::new(std::env::current_exe()?)
-            .arg("index")
-            .arg(".")
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .status()
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("index").arg(".").current_dir(root);
+        cmd.stdout(Stdio::null()).stderr(log);
+        if hint.is_some() {
+            cmd.arg("--paths-from-stdin").stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        let mut child = cmd.spawn()?;
+        if let (Some(paths), Some(mut stdin)) = (&hint, child.stdin.take()) {
+            let mut list = String::new();
+            for p in paths {
+                list.push_str(p);
+                list.push('\n');
+            }
+            stdin.write_all(list.as_bytes())?;
+        }
+        child.wait()
     })();
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     eprint!("{log}");
@@ -168,23 +220,40 @@ fn build(root: &Path) -> Status {
 mod tests {
     use super::*;
 
+    fn path(p: &str) -> Option<Change> {
+        Some(Change::Path(p.to_string()))
+    }
+
     #[test]
-    fn only_changes_that_can_reach_the_index_count() {
+    fn source_edits_are_named_and_everything_else_walks_or_is_ignored() {
         let d = std::env::temp_dir().join(format!("codenav-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("src")).unwrap();
         std::fs::write(d.join("Makefile"), b"").unwrap();
 
-        assert!(relevant(&d, &d.join("src/a.c")));
-        assert!(relevant(&d, &d.join("lib/x.py")));
+        // Named the way the walk names them, so the build can look them up.
+        assert_eq!(classify_path(&d, &d.join("src/a.c")), path("./src/a.c"));
+        assert_eq!(classify_path(&d, &d.join("lib/x.py")), path("./lib/x.py"));
         // Our own writes must not retrigger a build, or it never settles.
-        assert!(!relevant(&d, &d.join(".codenav/main-3/names.fst")));
-        assert!(!relevant(&d, &d.join(".git/index")));
+        assert_eq!(
+            classify_path(&d, &d.join(".codenav/main-3/names.fst")),
+            None
+        );
+        assert_eq!(classify_path(&d, &d.join(".git/index")), None);
         // An existing non-source file cannot change the index...
-        assert!(!relevant(&d, &d.join("Makefile")));
-        // ...but a directory, or something that vanished, might hold sources.
-        assert!(relevant(&d, &d.join("src")));
-        assert!(relevant(&d, &d.join("renamed-away")));
+        assert_eq!(classify_path(&d, &d.join("Makefile")), None);
+        // ...but a directory, or something that vanished, might hold sources,
+        // and only a walk can say which.
+        assert_eq!(classify_path(&d, &d.join("src")), Some(Change::Walk));
+        assert_eq!(
+            classify_path(&d, &d.join("renamed-away")),
+            Some(Change::Walk)
+        );
+        // Outside the tree means the paths are not what we think: walk.
+        assert_eq!(
+            classify_path(&d, Path::new("/elsewhere/a.c")),
+            Some(Change::Walk)
+        );
     }
 
     #[test]
@@ -193,18 +262,21 @@ mod tests {
         let d = Path::new("/tree");
         let at = |kind| notify::Event::new(kind).add_path(d.join("src/a.c"));
         // The build itself opens every file; on inotify that is an event.
-        assert!(!wanted(
-            d,
-            &at(EventKind::Access(AccessKind::Open(AccessMode::Any)))
-        ));
-        assert!(!wanted(
+        assert!(classify(d, &at(EventKind::Access(AccessKind::Open(AccessMode::Any)))).is_empty());
+        assert!(classify(
             d,
             &at(EventKind::Access(AccessKind::Close(AccessMode::Read)))
-        ));
-        assert!(wanted(
-            d,
-            &at(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
-        ));
-        assert!(wanted(d, &at(EventKind::Any)));
+        )
+        .is_empty());
+        assert_eq!(
+            classify(d, &at(EventKind::Modify(ModifyKind::Data(DataChange::Any)))),
+            vec![Change::Path("./src/a.c".into())]
+        );
+    }
+
+    #[test]
+    fn a_rescan_request_means_walk() {
+        let ev = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert_eq!(classify(Path::new("/tree"), &ev), vec![Change::Walk]);
     }
 }

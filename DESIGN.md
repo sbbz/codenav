@@ -151,6 +151,9 @@ Write-once, sorted and packed, memory-mapped, never fully loaded. The full datas
 | `closures.bin/.idx` | per-file include closure (roaring bitmaps) |
 | `pcs.bin/.idx` | presence-condition cubes |
 | `roots.txt` | inferred include roots |
+| `edges`, `unresolved.tsv` | direct include/import edges, and includes that resolved to nothing — what an update recomputes closures from (§7) |
+| `directives.bin/.idx` | each file's directive tokens, so an update can read its closure's macros without re-lexing (§7) |
+| `py_roots.txt`, `unresolved_py.tsv` | the Python import resolver's roots, and imports that resolved to nothing |
 
 Those live in a **generation directory**. `.codenav/` itself holds:
 
@@ -158,7 +161,7 @@ Those live in a **generation directory**. `.codenav/` itself holds:
 |---|---|
 | `CURRENT` | names the live generation: `main-N`, and `overlay-M` if there is one |
 | `main-N/` | a full index, as above |
-| `overlay-M/` | files re-indexed since `main-N` was built, plus `tombstones.bin` |
+| `overlay-M/` | files re-indexed since `main-N` was built, plus `tombstones.bin` and the sets an update needs next time: removed files, recomputed closures, changed edges |
 | `manifest.tsv` | per-file hashes for incremental |
 | `lock` | held for the whole of a build |
 | `last-build.log` | output of the last build the watcher ran |
@@ -246,30 +249,49 @@ The signal is meant to pick *which* definition you mean, not to promote a protot
 
 A file's symbols depend on exactly two things: its own text, and the macros visible in its closure. Headers are indexed as *their own files*, never inlined into including TUs — so a body edit, **even to a header**, dirties that file alone.
 
-Only two kinds of change escape a file:
+An update re-extracts exactly:
 
-- its **macro exports** changed → anything whose closure contains it may expand differently;
-- its **includes** changed → closures shift downstream.
+- every **changed or added** file;
+- every file whose **closure changed** — an `#include` was added or removed, a new header satisfies an include that used to resolve to nothing (even in a file nobody touched), or a header was deleted;
+- every file that can see a header whose **macro exports** changed.
 
-`manifest.tsv` records a content hash, an export signature and an edge hash per file. The planner falls back to a full rebuild when exports change, edges change, files are added or removed (FileIds shift), or the blast radius exceeds 25%.
+`manifest.tsv` records a content hash, an export signature and an edge hash per file. The export signature hashes macro names and bodies by *spelling*: it used to hash interned ids, which differ between a full build's interner and an update's, so every save of a header with a `#define` looked like a macro change and forced a 341 s rebuild for a comment edit.
 
-To re-expand a dirty file, only its **closure** needs rescanning — ~1,020 files on the kernel rather than 63,779.
+**Closures are recomputed, not patched.** The full build stores each file's direct edges and its unresolved includes. When any edge moves, the update reruns the full build's own closure computation over the whole edge table (~1.1 s on the kernel) and diffs it against what is stored. That makes an update's closures match a full build's by construction, cycles included, rather than by a second, subtler algorithm.
 
-Results go to a small **overlay** index with the superseded FileIds tombstoned. Queries read both shards and skip tombstoned results from main, so a one-file edit never rewrites the 4.8 GB main index. `SymbolId`s are namespaced by offsetting overlay ids past the end of main. Compaction is a full rebuild, triggered past 15% of the tree.
+**FileIds never move.** An added file takes the next id; a deleted one keeps its id, is tombstoned, and becomes unresolvable — includes that reached it are re-resolved and may find another file of the same name.
+
+**Macros come from a cache.** Re-expanding a file needs the macros of its whole closure — ~1,020 headers on the kernel. The full build stores each file's directive tokens (`directives.bin`, ~700 MB on the kernel), so an update decodes those instead of re-lexing the files: 25–30 ms instead of 107–118 ms.
+
+Results go to an **overlay** with the superseded FileIds tombstoned. Queries read both shards and skip tombstoned results from main, so an update never rewrites the multi-gigabyte main index. Dirty files are re-extracted in parallel, in batches. Files an earlier overlay already covered are **carried forward by copying their records**, not re-extracted.
+
+Carrying is still not free: each covered file costs ~0.64 ms per update, because the overlay is copied and rewritten every time. Measured with the caps removed, a macro change in `kernel_stat.h` dirtied 21,972 files and took 109 s against 268 s for a full rebuild — but every save after it took 14.4 s. So the overlay is capped at **2,500 files**, keeping a save under ~1.6 s, and anything larger is a full rebuild. That still covers a macro change in 95% of the kernel's 26,863 headers; 88% reach at most 100 files. Two-layer overlays or compacting into a new main would remove the cap's cost; neither is built.
+
+An update must leave the index exactly as a full rebuild would. `tests/incremental_equivalence.rs` applies every kind of edit, updates, and compares every symbol, occurrence and closure against a from-scratch build of the same tree — once walking the tree and once told the changed paths.
 
 ### Finding the edit cost more than applying it
 
-The manifest also records each file's **mtime and size**, and a rescan reads a file's bytes only when its stat differs. Without that, discovering which single file changed meant reading and hashing the whole 1.36 GiB tree — 1.2 s of a 2.15 s update, against 0.17 s of work actually proportional to the edit. The remaining fixed cost is the directory walk and rebuilding the 64,201-entry `FileRegistry`.
+The manifest also records each file's **mtime and size**, and a rescan reads a file's bytes only when its stat differs. This trusts stat the way git and ninja do: a file rewritten with its mtime and size preserved is missed. That requires a deliberate `touch -r`; a zero mtime always forces a read.
 
-This trusts stat the way git and ninja do: a file rewritten with its mtime and size preserved is missed. That requires a deliberate `touch -r`; a zero mtime always forces a read.
+Even with stat, finding *which* file changed meant walking the tree — ~0.4 s of a ~0.9 s one-file update on the kernel. The watcher already knows which files changed, so it passes them to the build, which re-stats just those against the manifest. Anything an event cannot pin to a file — a directory renamed or deleted, a path that vanished, a backend rescan, an error — makes the build walk as before.
+
+Kernel, `CODENAV_PROFILE=1` breakdown of a one-file update told the path (~0.35 s wall):
+
+| Phase | ms |
+|---|---|
+| Path table, edges, registry | 65–72 |
+| Macros of the file's closure (cached) | 25–30 |
+| Re-extract the file | 55–62 |
+| Write overlay | 66–75 |
+| Write manifest | 29–35 |
 
 | | Kernel | Python stdlib |
 |---|---|---|
-| Nothing changed | **0.52 s** | 0.03 s |
-| One file edited | **1.27 s** | **0.07 s** |
+| One file edited | **~0.35 s** | **0.07 s** |
+| File added or removed, `#include` changed | **~1.5 s** | — |
 | Full rebuild | ~116 s | 1.3 s |
 
-Kernel rows are hyperfine medians editing `fs/read_write.c`, whose large include closure makes it a slow case; an earlier measurement of a different file gave 0.83 s. Publishing each update as a fresh generation (§5) costs ~23 ms over the old in-place overlay write, measured A/B on a 10,000-file kernel subset.
+Publishing each update as a fresh generation (§5) costs ~23 ms over an in-place write, measured A/B on a 10,000-file kernel subset.
 
 ---
 
@@ -318,7 +340,6 @@ Worth recording, because each cost real time:
 
 - `READ_ONCE` ranks a `tools/` copy above the real one; the kernel reaches it through `asm/rwonce.h`, a **build-time generated** header that does not exist in a clean checkout.
 - A macro defined before an `#include` does not reach that header (§2.3).
-- Python import changes do not trigger a rebuild. Symbols stay correct — Python extraction reads only the file's own text — but ranking refreshes on the next full rebuild.
 - Presence conditions are per-shard, so overlay symbols are treated as unconditional until the next compaction.
 - **Extraction coverage is not 100%.** With editor context, 396 of 400 real kernel functions resolve to a definition (the other 4 do not exist in this tree); without context 380 do. The rest lose their body to tree-sitter error recovery triggered elsewhere in the file — `fs/buffer.c` still reports one error node and 48 of 54 resolve, from a macro shadowing the variable it guards (above) — a config-less consequence, not a pass to fix. The ranking weight cannot help here; the symbol is not in the index.
 
@@ -347,6 +368,9 @@ Golden queries assert **top-N position**, not just presence — an answer you ha
 | Full rebuild kept the previous overlay | stale tombstones named `FileId`s from the *old* main index and masked symbols the rebuild had just written correctly | `def pr_fmt --from fs/aio.c` lost its own definition among 2,375 others |
 | Builds rewrote index files in place | a running server kept answering from its mappings — old offsets into new contents | after a rebuild, `def helper` returned nothing although `helper` was unchanged |
 | Watcher counted inotify opens as changes | each build's own reads triggered the next build | Linux only: a permanent rebuild loop, ~0.5 s of CPU per cycle on the kernel |
+| Export signatures hashed interned ids | ids depend on interning order, which differs between a full build and an update | every save of a header with a `#define` forced a full rebuild — 341 s for a comment edit |
+| Updates never re-added macro definitions | the full build emits macro symbols from the macro table; the update path did not | editing a header made its macros vanish from go-to-definition |
+| Fixing the above updated an ambiguity hash too | every `#undef` of a name hashes alike, so it became one more competing meaning | 39,244 kernel symbols (0.25%) silently stopped being generated — caught by checking the count against the baseline |
 
 The full-rebuild overlay bug is worth dwelling on: it fires on the *fallback* path, which is common — any header whose macro exports change forces a full rebuild — and the symptom is a query that still returns thousands of correct-looking results, just not the right one. It was found only because the golden suite pins a specific expected file, and it is why a full build publishes a main index with *no* overlay rather than carrying the old one forward.
 

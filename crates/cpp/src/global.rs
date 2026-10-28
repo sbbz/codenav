@@ -76,12 +76,14 @@ impl GlobalMacros {
         let v = self.defs.entry(name).or_default();
         // Same file and same guard means a re-scan, not a new variant.
         if let Some(slot) = v.iter_mut().find(|d| d.file == file && d.def.pc == def.pc) {
-            *slot = GlobalDef {
-                file,
-                def,
-                hash,
-                export,
-            };
+            // The fingerprint follows the latest definition, or change
+            // detection would miss a redefinition. `hash` deliberately keeps
+            // the first one: it counts competing meanings, and every `#undef`
+            // of a name hashes alike, so updating it here added a meaning
+            // wherever a header undefines a macro after use — pushing such
+            // macros past MAX_VARIANTS and costing 1% of all symbols.
+            slot.def = def;
+            slot.export = export;
             return;
         }
         v.push(GlobalDef {

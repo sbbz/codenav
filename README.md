@@ -167,21 +167,31 @@ Most tools need `-I` and `-D` flags. codenav infers them:
 
 ## Staying current
 
-`codenav serve` (what the editor runs) and `codenav watch` watch the tree with the OS's native file events and re-index after every change. On the kernel a saved edit is queryable **~1.5 s later**. Without either, run `codenav index .` again — it only redoes what changed.
+`codenav serve` (what the editor runs) and `codenav watch` watch the tree with the OS's native file events and re-index after every change. The watcher tells the build which files changed, so it never walks the tree for an ordinary save. Without either, run `codenav index .` again — it only redoes what changed.
+
+| Change (Linux kernel) | Re-index |
+|---|---|
+| Edit a `.c` or a header's body | **~0.35 s** |
+| Add or delete a file, add or remove an `#include` | **~1.5 s** |
+| Change a `#define` in a header | re-indexes every file that can see it: ~1 s for 88% of the kernel's headers (≤100 dependents) |
+| …in one of the 5% of headers seen by >2,500 files | full rebuild |
 
 **Why it's fast:** a file's symbols depend only on its own text plus the macros
 its includes provide. Headers are indexed as their own files, never pasted into
 every `.c` that includes them — so editing a header's body dirties that header
-alone. Re-indexed files go into a small overlay; the main index isn't rewritten.
+alone. A `#define` change dirties exactly the files whose include closure
+contains the header, re-extracted in parallel. Each file's macros are cached at
+build time, so re-expanding a file doesn't mean re-lexing its ~1,000 headers.
+Re-indexed files go into a small overlay; the main index isn't rewritten.
 
-**Falls back to a full rebuild when:**
+An update leaves the index **identical to a full rebuild** of the same tree —
+`tests/incremental_equivalence.rs` checks every kind of edit against one.
 
-- a file's `#define`s changed (dependents may expand differently)
-- includes/imports changed (closures shift)
-- files were added or removed
-- the overlay grows past 15% of the tree
+**Falls back to a full rebuild when** an update would leave more than 2,500
+files in the overlay. Every later update copies the overlay forward, at ~0.6 ms
+per file, so a bigger one would slow down every save that follows.
 
-**Safe to rebuild under a running server.** A build never touches the index files a server has mapped: it writes a new generation and swaps a pointer to it, and the server switches over on its next request. Builds take a lock, so the watcher and a `codenav index` in a terminal never interleave. A burst of changes — a branch switch touching thousands of files — becomes one build, and builds run as a child process, so a full rebuild's memory (5.4 GB peak on the kernel) never stays with the server.
+**Safe to rebuild under a running server.** A build never touches the index files a server has mapped: it writes a new generation and swaps a pointer to it, and the server switches over on its next request. Builds take a lock, so the watcher and a `codenav index` in a terminal never interleave. A burst of changes — a branch switch touching thousands of files — becomes one build, and builds run as a child process, so a full rebuild's memory (~4 GB peak on the kernel) never stays with the server.
 
 ---
 
@@ -189,7 +199,6 @@ alone. Re-indexed files go into a small overlay; the main index isn't rewritten.
 
 - `READ_ONCE` ranks a `tools/` copy above the real one. The kernel reaches it via a **build-time generated header** we don't have.
 - A macro a file defines *before* including a header doesn't reach that header (kernel `#define pr_fmt` pattern). Costs string contents, not symbols.
-- Python import changes don't trigger a rebuild. Symbols stay correct — Python extraction reads only the file's own text — but ranking refreshes on the next full rebuild.
 
 ---
 
